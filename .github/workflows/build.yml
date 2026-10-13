@@ -12,11 +12,6 @@ on:
         description: Pull request number to build
         required: true
         type: string
-      linux:
-        description: Also build and test on Linux
-        required: false
-        default: true
-        type: boolean
 
 permissions:
   contents: read
@@ -108,7 +103,7 @@ jobs:
             }
             const files = await github.paginate(github.rest.pulls.listFiles, { owner, repo, pull_number, per_page: 100 });
             const paths = files.flatMap((file) => [file.filename, file.previous_filename].filter(Boolean));
-            const touches = (...prefixes) => files.length >= 3000 ||
+            const touches = (...prefixes) => manual || files.length >= 3000 ||
               paths.some((path) => prefixes.some((prefix) => prefix.endsWith('/') ? path.startsWith(prefix) : path === prefix));
             const workflow = '.github/workflows/build.yml';
             const libc = 'core/libs/prx/libc/';
@@ -160,6 +155,7 @@ jobs:
         with:
           ref: ${{ needs.eligibility.outputs.sha }}
           persist-credentials: false
+
       - name: Merge the pull request into main
         if: ${{ needs.eligibility.outputs.head != '' }}
         shell: bash
@@ -170,21 +166,33 @@ jobs:
           git fetch --no-tags --unshallow origin "refs/pull/$PR_NUMBER/head"
           if [ "$(git rev-parse FETCH_HEAD)" != "$PR_HEAD" ]; then echo "::error::The pull request has newer commits; start a new build"; exit 1; fi
           if ! git -c user.name=ci -c user.email=ci@localhost merge --no-ff --no-edit FETCH_HEAD; then echo "::error::The pull request does not merge cleanly into main; rebase it first"; exit 1; fi
+
       - if: runner.os == 'Windows'
         id: toolchain
         uses: actions/cache@v6
         with:
           path: C:\winlibs
           key: ${{ env.WINLIBS_ZIP }}
+
       - if: runner.os == 'Windows' && steps.toolchain.outputs.cache-hit != 'true'
         run: |
           curl -sSfL -o "$RUNNER_TEMP/winlibs.zip" "https://github.com/brechtsanders/winlibs_mingw/releases/download/$WINLIBS_RELEASE/$WINLIBS_ZIP"
           7z x "$RUNNER_TEMP/winlibs.zip" -oC:/winlibs > /dev/null
+
       - if: runner.os == 'Windows'
         run: echo 'C:\winlibs\mingw64\bin' >> "$GITHUB_PATH"
+
       - run: cmake -S . -B build-relinker -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_COMPILER=${{ matrix.compiler }} -DANYPS5_RELINKER_ONLY=ON -DBUILD_TESTING=ON
       - run: cmake --build build-relinker --parallel 3
       - run: ctest --test-dir build-relinker --output-on-failure --timeout 120
+
+      - name: Upload relinker artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: relinker-${{ matrix.os }}
+          path: |
+            build-relinker/**
 
   register-context:
     needs: eligibility
@@ -198,9 +206,18 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v7
+
       - run: cmake -S core/libs/tests/register_context -B build/register-context -DCMAKE_BUILD_TYPE=${{ matrix.configuration }}
       - run: cmake --build build/register-context --parallel
       - run: ctest --test-dir build/register-context --output-on-failure --repeat until-fail:3 --no-tests=error
+
+      - name: Upload register-context artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: register-context-${{ matrix.os }}-${{ matrix.configuration }}
+          path: |
+            build/register-context/**
 
   write-watch:
     needs: eligibility
@@ -213,13 +230,22 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v7
+
       - run: cmake -S core/libs/tests/write_watch -B build/write-watch -DCMAKE_BUILD_TYPE=Release
       - run: cmake --build build/write-watch --parallel
       - run: ctest --test-dir build/write-watch --output-on-failure --repeat until-fail:3 --no-tests=error
 
+      - name: Upload write-watch artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: write-watch-${{ matrix.os }}
+          path: |
+            build/write-watch/**
+
   linux:
     needs: eligibility
-    if: ${{ (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.linux)) && needs.eligibility.outputs.full == 'true' }}
+    if: ${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && needs.eligibility.outputs.full == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -228,6 +254,7 @@ jobs:
           ref: ${{ needs.eligibility.outputs.sha }}
           persist-credentials: false
           submodules: true
+
       - name: Merge the pull request into main
         if: ${{ needs.eligibility.outputs.head != '' }}
         shell: bash
@@ -239,22 +266,16 @@ jobs:
           if [ "$(git rev-parse FETCH_HEAD)" != "$PR_HEAD" ]; then echo "::error::The pull request has newer commits; start a new build"; exit 1; fi
           if ! git -c user.name=ci -c user.email=ci@localhost merge --no-ff --no-edit FETCH_HEAD; then echo "::error::The pull request does not merge cleanly into main; rebase it first"; exit 1; fi
           git submodule update --init --recursive
+
       - uses: hendrikmuhs/ccache-action@v1.2.24
         with:
           key: linux
           save: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
           evict-old-files: job
+
       - name: Install lavapipe and the SDL audio and XRandR development files
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libvulkan1 mesa-vulkan-drivers libpipewire-0.3-dev libpulse-dev libasound2-dev libxrandr-dev
-      - id: mesa
-        run: |
-          echo "version=$(dpkg-query -W -f='${Version}' mesa-vulkan-drivers)" >> "$GITHUB_OUTPUT"
-          echo "cpu=$(grep -m1 '^flags' /proc/cpuinfo | sha256sum | cut -c1-12)" >> "$GITHUB_OUTPUT"
-      - uses: actions/cache/restore@v6
-        with:
-          path: .mesa-shader-cache
-          key: mesa-${{ steps.mesa.outputs.version }}-${{ steps.mesa.outputs.cpu }}-${{ github.sha }}
-          restore-keys: mesa-${{ steps.mesa.outputs.version }}-${{ steps.mesa.outputs.cpu }}-
+
       - run: cmake -S . -B build $CONFIGURE -DANYPS5_ENABLE_SPIRV_TOOLS=ON
       - name: Check that every test executable is registered with ctest
         run: python3 tools/check_test_registration.py build
@@ -264,20 +285,25 @@ jobs:
         env:
           ANYPS5_REQUIRE_VULKAN: 1
           GALLIUM_OVERRIDE_CPU_CAPS: avx
-          MESA_SHADER_CACHE_DIR: ${{ github.workspace }}/.mesa-shader-cache
-      - if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && !cancelled() }}
-        uses: actions/cache/save@v6
-        with:
-          path: .mesa-shader-cache
-          key: mesa-${{ steps.mesa.outputs.version }}-${{ steps.mesa.outputs.cpu }}-${{ github.sha }}
       - run: python3 tools/check_skips.py build/ctest.xml
+
       - name: Report tests slower than 30 s
         if: ${{ !cancelled() }}
         shell: bash
         run: |
           [ -f ctest.log ] || exit 0
           awk '/Test +#[0-9]+: / && $NF == "sec" { for (i = 1; i <= NF; i++) if ($i ~ /^#[0-9]+:$/) name = $(i + 1); t = $(NF - 1) + 0; if (t > max[name]) max[name] = t }
-            END { for (name in max) if (max[name] > 30) printf "::warning title=Slow test::%s took %.1f s on %s; tests must finish in 30 s (CONTRIBUTING.md)\n", name, max[name], ENVIRON["RUNNER_OS"] }' ctest.log
+            END { for (name in max) if (max[name] > 30) printf "::warning title=Slow test::%s took %.1f s on %s; tests must finish in 30 s (CONTRIBUTING.md)\n", name, max[name], ENVIRON["RUNNER_OS"] }' ctest.log || true
+
+      - name: Upload linux build artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-linux
+          path: |
+            build/**
+            ctest.log
+            ctest.xml
 
   windows:
     needs: eligibility
@@ -297,6 +323,7 @@ jobs:
           ref: ${{ needs.eligibility.outputs.sha }}
           persist-credentials: false
           submodules: true
+
       - name: Merge the pull request into main
         if: ${{ needs.eligibility.outputs.head != '' }}
         shell: bash
@@ -308,37 +335,58 @@ jobs:
           if [ "$(git rev-parse FETCH_HEAD)" != "$PR_HEAD" ]; then echo "::error::The pull request has newer commits; start a new build"; exit 1; fi
           if ! git -c user.name=ci -c user.email=ci@localhost merge --no-ff --no-edit FETCH_HEAD; then echo "::error::The pull request does not merge cleanly into main; rebase it first"; exit 1; fi
           git submodule update --init --recursive
+
       - id: toolchain
         uses: actions/cache@v6
         with:
           path: C:\winlibs
           key: ${{ env.WINLIBS_ZIP }}
+
       - if: steps.toolchain.outputs.cache-hit != 'true'
         run: |
           curl -sSfL -o "$RUNNER_TEMP/winlibs.zip" "https://github.com/brechtsanders/winlibs_mingw/releases/download/$WINLIBS_RELEASE/$WINLIBS_ZIP"
           7z x "$RUNNER_TEMP/winlibs.zip" -oC:/winlibs > /dev/null
+
       - run: echo 'C:\winlibs\mingw64\bin' >> "$GITHUB_PATH"
+
       - uses: hendrikmuhs/ccache-action@v1.2.24
         with:
           key: windows
           save: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
           evict-old-files: job
+
       - shell: cmd
-        run: cmake -S . -B build %CONFIGURE% "-DANYPS5_AGC_EXECUTION_TESTS=F16ToF32Unpack;F64FmaSubnormals;RegistrationPrepareShutdown"
+        run: cmake -S . -B build %CONFIGURE%
+
       - name: Check that every test executable is registered with ctest
         shell: cmd
         run: python tools/check_test_registration.py build
+
       - shell: cmd
         run: cmake --build build
+
       - shell: cmd
         run: cmake --build build --target libs
+
       - shell: cmd
         run: ctest --test-dir build --output-on-failure --timeout 120 --parallel 4 --output-log ctest.log --output-junit ctest.xml
+
       - run: python tools/check_skips.py build/ctest.xml --job windows
+
       - name: Report tests slower than 30 s
         if: ${{ !cancelled() }}
         shell: bash
         run: |
           [ -f ctest.log ] || exit 0
           awk '/Test +#[0-9]+: / && $NF == "sec" { for (i = 1; i <= NF; i++) if ($i ~ /^#[0-9]+:$/) name = $(i + 1); t = $(NF - 1) + 0; if (t > max[name]) max[name] = t }
-            END { for (name in max) if (max[name] > 30) printf "::warning title=Slow test::%s took %.1f s on %s; tests must finish in 30 s (CONTRIBUTING.md)\n", name, max[name], ENVIRON["RUNNER_OS"] }' ctest.log
+            END { for (name in max) if (max[name] > 30) printf "::warning title=Slow test::%s took %.1f s on %s; tests must finish in 30 s (CONTRIBUTING.md)\n", name, max[name], ENVIRON["RUNNER_OS"] }' ctest.log || true
+
+      - name: Upload windows build artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-windows
+          path: |
+            build/**
+            ctest.log
+            ctest.xml
